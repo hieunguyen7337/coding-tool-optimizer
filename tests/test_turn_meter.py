@@ -2407,5 +2407,43 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(meter_usd, lane_usd, places=12)
 
 
+class ChooseOpenTests(unittest.TestCase):
+    # 2026-11-20: `turn-meter current` run from ~ reported an 11-11 open turn of 221 h, left by a session that never
+    # ran its Stop hook, because the folder matched. The session's own id and a staleness cut now come first.
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.state = os.path.join(self.root, "state")
+        os.makedirs(os.path.join(self.state, "turns", "open"))
+        self.cwd = os.path.realpath(self.root)
+        now = dt.datetime.now(UTC)
+        self.write("stale", now - dt.timedelta(days=9), self.cwd)
+        self.write("mine", now - dt.timedelta(minutes=3), os.path.join(self.root, "elsewhere"))
+        self.write("other", now - dt.timedelta(minutes=1), os.path.join(self.root, "third"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def write(self, session, started, cwd):
+        path = os.path.join(self.state, "turns", "open", session + ".json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"session_id": session, "turn_id": "t-" + session, "cwd": cwd,
+                       "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ")}, handle)
+
+    def choose(self, env_id):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": env_id}), \
+                mock.patch.object(meter.os, "getcwd", return_value=self.cwd):
+            return meter._choose_open(self.state, None)
+
+    def test_own_session_id_wins_over_folder(self):
+        self.assertEqual(self.choose("mine")["session_id"], "mine")
+
+    def test_stale_turn_in_same_folder_is_skipped(self):
+        self.assertEqual(self.choose("")["session_id"], "other")
+
+    def test_explicit_session_still_wins(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "mine"}):
+            self.assertEqual(meter._choose_open(self.state, "stale")["session_id"], "stale")
+
+
 if __name__ == "__main__":
     unittest.main()

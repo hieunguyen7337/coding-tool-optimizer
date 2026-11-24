@@ -414,3 +414,135 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(code, 0, stdout + "\n" + stderr)
             lines = [line for line in stdout.splitlines() if line.strip()]
             self.assertEqual(lines, ["10 test_a.py", "10 test_b.py test_c.py"])
+
+
+def git(root, *args):
+    subprocess.run(
+        ["git", "-C", root, "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+
+class ChangedSelectionTests(unittest.TestCase):
+    def make_repo(self, tmp):
+        git(tmp, "init", "-q", "-b", "master")
+        write(os.path.join(tmp, "tests", "test_a.py"), 'import fake_x\nX = "bin/tool-a"\n')
+        write(os.path.join(tmp, "tests", "test_b.py"), 'Y = "tools/helper.py"\nZ = "README.md"\n')
+        write(os.path.join(tmp, "tests", "test_c.py"), 'W = "fixtures/data.txt"\n')
+        write(os.path.join(tmp, "tests", "fake_x.py"), "a = 1\n")
+        write(os.path.join(tmp, "bin", "tool-a"), "a\n")
+        write(os.path.join(tmp, "bin", "tool"), "a\n")
+        write(os.path.join(tmp, "tools", "helper.py"), "a\n")
+        write(os.path.join(tmp, "tests", "fixtures", "data.txt"), "a\n")
+        write(os.path.join(tmp, "README.md"), "a\n")
+        write(os.path.join(tmp, "NOTES.md"), "a\n")
+        write(os.path.join(tmp, "install.sh"), "a\n")
+        copy_runner(tmp)
+        git(tmp, "add", "-A")
+        git(tmp, "commit", "-q", "-m", "base")
+        git(tmp, "branch", "base")
+
+    def selected(self, tmp, *extra):
+        git(tmp, "add", "-A")
+        code, out, err = run_script(tmp, ["--changed", "base", "--print-selected", *extra], timeout=60)
+        self.assertEqual(code, 0, out + err)
+        return out
+
+    def commit_change(self, tmp, rel):
+        write(os.path.join(tmp, rel), "changed\n")
+        git(tmp, "add", "-A")
+        git(tmp, "commit", "-q", "-m", "change " + rel)
+
+    def run_case(self, rel):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_repo(tmp)
+            self.commit_change(tmp, rel)
+            return self.selected(tmp)
+
+    def test_test_module_selects_itself(self):
+        out = self.run_case("tests/test_c.py")
+        self.assertEqual(out.strip(), "test_c.py  tests/test_c.py changed")
+
+    def test_fake_and_fixture_select_mentioning_modules(self):
+        self.assertEqual(self.run_case("tests/fake_x.py").split()[0], "test_a.py")
+        out = self.run_case("tests/fixtures/data.txt")
+        self.assertTrue(out.startswith("test_c.py  test_c.py mentions data.txt"), out)
+        self.assertNotIn("test_a.py", out)
+
+    def test_bin_and_tools_select_mentioning_modules(self):
+        out = self.run_case("bin/tool-a")
+        self.assertIn("test_a.py  test_a.py mentions tool-a", out)
+        self.assertNotIn("whole suite", out)
+        out = self.run_case("tools/helper.py")
+        self.assertEqual(out.strip(), "test_b.py  test_b.py mentions helper")
+        # "tool" must not match "tool-a" (simple boundary rule), so bin/tool maps to nothing: whole suite.
+        out = self.run_case("bin/tool")
+        self.assertIn("whole suite: bin/tool changed", out)
+
+    def test_docs_select_by_basename_else_nothing(self):
+        self.assertIn("test_b.py  test_b.py mentions README.md", self.run_case("README.md"))
+        out = self.run_case("NOTES.md")
+        self.assertEqual(out.strip(), "no test module selected")
+
+    def test_unmapped_file_selects_whole_suite_and_names_it(self):
+        out = self.run_case("install.sh")
+        self.assertIn("whole suite: install.sh changed and maps to no test module", out)
+        for name in ("test_a.py", "test_b.py", "test_c.py"):
+            self.assertIn(name + "  install.sh changed", out)
+
+    def test_uncommitted_and_untracked_files_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_repo(tmp)
+            write(os.path.join(tmp, "tools", "helper.py"), "dirty\n")
+            write(os.path.join(tmp, "tests", "test_new.py"), "x = 1\n")
+            code, out, err = run_script(tmp, ["--changed", "base", "--print-selected"], timeout=60)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("test_b.py", out)
+            self.assertIn("test_new.py  tests/test_new.py changed", out)
+
+    def test_default_base_prefers_origin_master_then_head_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_repo(tmp)
+            self.commit_change(tmp, "tests/test_c.py")
+            self.commit_change(tmp, "tools/helper.py")
+            # No origin: HEAD~1 -> only the last commit.
+            code, out, err = run_script(tmp, ["--changed", "--print-selected"], timeout=60)
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(out.strip().splitlines()[0].split()[0], "test_b.py")
+            self.assertNotIn("test_c.py  tests/test_c.py", out)
+            # origin/master at the first commit: both commits count.
+            git(tmp, "update-ref", "refs/remotes/origin/master", "base")
+            code, out, err = run_script(tmp, ["--changed", "--print-selected"], timeout=60)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("test_c.py  tests/test_c.py changed", out)
+            self.assertIn("test_b.py", out)
+
+    def test_changed_runs_selected_modules_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git(tmp, "init", "-q", "-b", "master")
+            copy_runner(tmp)
+            write(os.path.join(tmp, "tests", "test_p.py"), OK_TEST)
+            write(os.path.join(tmp, "tests", "test_q.py"), OK_TEST)
+            git(tmp, "add", "-A")
+            git(tmp, "commit", "-q", "-m", "base")
+            git(tmp, "branch", "base")
+            write(os.path.join(tmp, "tests", "test_q.py"), OK_TEST + "\n")
+            times = os.path.join(tmp, "times.json")
+            code, out, err = run_script(
+                tmp, ["--changed", "base", "--jobs", "1", "--times", times, "--timeout", "60"], timeout=90,
+            )
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("test_q", out)
+            self.assertNotIn("test_p", out)
+            self.assertTrue(os.path.exists(times))
+
+    def test_print_selected_needs_changed(self):
+        code, out, err = run_script(ROOT, ["--print-selected"], timeout=30)
+        self.assertEqual(code, 2)
+
+
+OK_TEST = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+
+
+if __name__ == "__main__":
+    unittest.main()

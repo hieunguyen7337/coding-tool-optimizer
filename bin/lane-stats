@@ -4094,6 +4094,207 @@ def timeline_command(args):
     return 0
 
 
+# ---- risk: review depth by diff risk ----
+
+RISK_DOC_PATTERNS = ["*.md", "*.txt", "docs/**", "findings/**", "LICENSE*", "CHANGELOG*"]
+RISK_DEEP_PATTERNS = [
+    "install.sh", "bin/lane-mask", "bin/cloud-setup", "bin/kit-update", "tools/publish-public.py",
+    "tools/release_bundle.py", "tools/make-bundle.sh", "tools/push-guard.py", ".github/**",
+    "**/*secret*", "**/*credential*", "**/*auth*", "**/*payment*", "**/*billing*", "**/auth/**",
+    "**/payments/**", "**/billing/**", "**/migrations/**", "**/*.sql", ".env*",
+]
+RISK_HASH_EXT = (".py", ".sh", ".yml", ".yaml", ".toml")
+RISK_SLASH_EXT = (".js", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".dart")
+RISK_SLASH_PREFIXES = ("//", "/*", "*", "*/")
+RISK_EMPTY_TREE = "4b825dc642cb1e5eef4ee1e8a5e2c9e3f6c0cd6f"
+RISK_REVIEWS = {
+    "light": "no Claude read needed; optional haiku low skim",
+    "normal": "one review arm from `lane-stats pick --class review`; Claude reads the diff",
+    "deep": "review arm + Haiku second reader; Claude reads every line; "
+            "`lane fable --role final-review` for a release",
+}
+
+
+def risk_glob_regex(pattern):
+    """A path glob: `*` stays inside one segment, `**/` spans any directories, a trailing `/**` any depth."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def risk_matches(path, patterns):
+    return any(risk_glob_regex(p).match(path) for p in patterns)
+
+
+def risk_string_list(value):
+    return [v for v in value if isinstance(v, str) and v] if isinstance(value, list) else []
+
+
+def risk_patterns(repo):
+    """(deep, light) patterns: arms.json explore.review_risk (else built-ins), plus the repo's own file."""
+    deep, light = list(RISK_DEEP_PATTERNS), list(RISK_DOC_PATTERNS)
+    try:
+        with open(catalog_path(), "r", encoding="utf-8") as stream:
+            block = json.load(stream).get("explore", {}).get("review_risk", {})
+        if isinstance(block, dict):
+            deep = risk_string_list(block.get("deep")) or deep
+            light = risk_string_list(block.get("light")) or light
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(os.path.join(repo, ".review-risk.json"), "r", encoding="utf-8") as stream:
+            extra = json.load(stream)
+    except (OSError, ValueError):
+        extra = None
+    if isinstance(extra, dict):
+        deep += [p for p in risk_string_list(extra.get("deep")) if p not in deep]
+        light += [p for p in risk_string_list(extra.get("light")) if p not in light]
+    return deep, light
+
+
+def risk_git(repo, *argv):
+    return subprocess.run(["git", "-C", repo, "-c", "core.quotepath=false"] + list(argv),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                          encoding="utf-8", errors="replace")
+
+
+def risk_base(repo, base):
+    if base:
+        merged = risk_git(repo, "merge-base", base, "HEAD")
+        return merged.stdout.strip() if merged.returncode == 0 and merged.stdout.strip() else base
+    for ref in ("origin/master", "origin/main"):
+        merged = risk_git(repo, "merge-base", ref, "HEAD")
+        if merged.returncode == 0 and merged.stdout.strip():
+            return merged.stdout.strip()
+    if risk_git(repo, "rev-parse", "--verify", "-q", "HEAD~1").returncode == 0:
+        return "HEAD~1"
+    return RISK_EMPTY_TREE
+
+
+def risk_parse_diff(text, files):
+    """files: path -> {"added": [...], "removed": [...], "binary": bool}, filled from one unified diff."""
+    current = None
+    in_hunk = False
+    for line in text.split("\n"):
+        header = re.match(r"diff --git a/(.+) b/\1\Z", line)
+        if header:
+            current = files.setdefault(header.group(1), {"added": [], "removed": [], "binary": False})
+            in_hunk = False
+        elif current is None:
+            continue
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            current["binary"] = True
+            in_hunk = False
+        elif in_hunk and line.startswith("+"):
+            current["added"].append(line[1:])
+        elif in_hunk and line.startswith("-"):
+            current["removed"].append(line[1:])
+    return files
+
+
+def risk_changes(repo, base):
+    """Changed files and lines: base...HEAD, uncommitted tracked changes and untracked files."""
+    start = risk_base(repo, base)
+    files = {}
+    committed = risk_git(repo, "diff", "--no-color", "--no-renames", "-U0", "--binary", start, "HEAD")
+    if committed.returncode != 0:
+        raise ValueError("git diff failed: {}".format(committed.stderr.strip() or "unknown error"))
+    risk_parse_diff(committed.stdout, files)
+    # No HEAD yet or a failing second diff just means nothing uncommitted to add.
+    pending = risk_git(repo, "diff", "--no-color", "--no-renames", "-U0", "--binary", "HEAD")
+    if pending.returncode == 0:
+        risk_parse_diff(pending.stdout, files)
+    # New files a worker wrote are untracked until Claude commits them; each line counts as added.
+    untracked = risk_git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    for path in (untracked.stdout.split("\0") if untracked.returncode == 0 else []):
+        if not path or path in files:
+            continue
+        info = files.setdefault(path, {"added": [], "removed": [], "binary": False})
+        try:
+            with open(os.path.join(repo, path), "rb") as stream:
+                data = stream.read(1 << 20)
+        except OSError:
+            continue
+        if b"\0" in data:
+            info["binary"] = True
+        else:
+            info["added"] = data.decode("utf-8", errors="replace").splitlines()
+    return files
+
+
+def risk_comment_prefixes(path):
+    name = path.rsplit("/", 1)[-1]
+    if name.endswith(RISK_HASH_EXT) or ("." not in name and path.startswith("bin/") and path.count("/") == 1):
+        return ("#",)
+    if name.endswith(RISK_SLASH_EXT):
+        return RISK_SLASH_PREFIXES
+    return None
+
+
+def risk_comment_only(path, info):
+    prefixes = risk_comment_prefixes(path)
+    if prefixes is None or info["binary"]:
+        return False
+    lines = info["added"] + info["removed"]
+    if not lines:
+        return False
+    return all(not l.strip() or l.lstrip().startswith(prefixes) for l in lines)
+
+
+def classify_risk(files, deep_patterns, light_patterns):
+    """The classifier: (tier, reasons, review) for {path: changed lines}."""
+    if not files:
+        return "light", ["no changes"], RISK_REVIEWS["light"]
+    paths = sorted(files)
+    deep = [p for p in paths if risk_matches(p, deep_patterns)]
+    if deep:
+        return "deep", ["sensitive path: " + p for p in deep], RISK_REVIEWS["deep"]
+    docs = [p for p in paths if risk_matches(p, light_patterns)]
+    comments = [p for p in paths if p not in docs and risk_comment_only(p, files[p])]
+    code = [p for p in paths if p not in docs and p not in comments]
+    if not code:
+        reasons = ["documentation: " + p for p in docs] + ["comment or blank lines only: " + p for p in comments]
+        return "light", reasons, RISK_REVIEWS["light"]
+    return "normal", ["code change: " + p for p in code], RISK_REVIEWS["normal"]
+
+
+def risk_command(args):
+    repo = os.path.abspath(args.dir or ".")
+    if not os.path.isdir(repo) or risk_git(repo, "rev-parse", "--git-dir").returncode != 0:
+        raise ValueError("not a git checkout: {}".format(repo))
+    files = risk_changes(repo, args.base)
+    deep_patterns, light_patterns = risk_patterns(repo)
+    tier, reasons, review = classify_risk(files, deep_patterns, light_patterns)
+    if args.json:
+        print(json.dumps({"tier": tier, "reasons": reasons, "files": sorted(files), "review": review}))
+        return 0
+    print(tier)
+    for reason in reasons[:10]:
+        print("  " + reason)
+    if len(reasons) > 10:
+        print("  ... {} reasons in all".format(len(reasons)))
+    print(review)
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="lane-stats")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -4220,6 +4421,11 @@ def build_parser():
     timeline_parser.add_argument("--refresh", type=int, metavar="SECONDS",
                                  help="with --html, the browser re-reads the file every N seconds (at least 10)")
     timeline_parser.set_defaults(func=timeline_command)
+    risk_parser = commands.add_parser("risk", help="classify a diff as light, normal or deep and print the review it calls for")
+    risk_parser.add_argument("--base", metavar="REF", help="diff base (default: merge base with origin/master, origin/main, HEAD~1)")
+    risk_parser.add_argument("--dir", metavar="DIR", help="git checkout to read (default: current directory)")
+    risk_parser.add_argument("--json", action="store_true")
+    risk_parser.set_defaults(func=risk_command)
     return parser
 
 

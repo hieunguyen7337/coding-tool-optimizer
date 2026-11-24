@@ -437,6 +437,113 @@ def module_sizes(root, names):
     return sizes
 
 
+_CHANGED_DIRS = ("bin/", "tools/", "tests/")
+
+
+def _git(root, args):
+    """Run git against root (never changes the checkout). Returns stdout lines, or None on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout.decode("utf-8", errors="replace")
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def default_base(root):
+    """Merge base with origin/master, else origin/main, else HEAD~1."""
+    for ref in ("origin/master", "origin/main"):
+        out = _git(root, ["merge-base", ref, "HEAD"])
+        if out:
+            return out[0].strip()
+    return "HEAD~1"
+
+
+def changed_files(root, base=None):
+    """Sorted changed paths: BASE...HEAD, uncommitted tracked changes, untracked under bin/ tools/ tests/.
+
+    None when git cannot answer (bad BASE, not a repository).
+    """
+    base = base or default_base(root)
+    committed = _git(root, ["diff", "--name-only", base + "...HEAD"])
+    if committed is None:
+        return None
+    found = set(committed)
+    found.update(_git(root, ["diff", "--name-only", "HEAD"]) or [])
+    found.update(_git(root, ["ls-files", "--others", "--exclude-standard", "--", "bin", "tools", "tests"]) or [])
+    return sorted(path.replace("\\", "/") for path in found)
+
+
+def _mentions(source, token):
+    """True when token appears in source as a path part or a quoted name.
+
+    Simple match: the token bounded by "/", quotes, backslash, whitespace or a string edge on both sides
+    (so `tools/lane-stats`, "lane-stats" and 'lane-stats' match, `lane-stats-extra` does not), with an
+    optional ".py" for tools. Comparison is case-sensitive.
+    """
+    pattern = r"(?<![\w.-])" + re.escape(token) + r"(?:\.py)?(?![\w-])"
+    return re.search(pattern, source) is not None
+
+
+def select_changed(files, names, sources):
+    """Map changed files to test modules. Returns (selected {name: [reasons]}, whole_suite_reason or None)."""
+    selected = {}
+
+    def add(name, reason):
+        selected.setdefault(name, [])
+        if reason not in selected[name]:
+            selected[name].append(reason)
+
+    def by_mention(path, token):
+        hits = [name for name in names if name in sources and _mentions(sources[name], token)]
+        for name in hits:
+            add(name, "{} mentions {}".format(name, token))
+        return hits
+
+    for path in files:
+        base = path.rsplit("/", 1)[-1]
+        if re.fullmatch(r"tests/test_[^/]*\.py", path):
+            if base in names:
+                add(base, "{} changed".format(path))
+            continue
+        if re.fullmatch(r"tests/fake_[^/]*\.py", path) or path.startswith("tests/fixtures/"):
+            # fake_x.py is usually imported as `fake_x`, so its stem counts as a mention too.
+            hits = by_mention(path, base)
+            if base.endswith(".py"):
+                hits += by_mention(path, base[:-3])
+            if hits:
+                continue
+            return selected, "{} changed and no test module mentions it".format(path)
+        if path.endswith(".md"):
+            by_mention(path, base)
+            continue
+        token = None
+        if path.startswith("bin/") and path.count("/") == 1:
+            token = base
+        elif path.startswith("tools/") and path.count("/") == 1 and path.endswith(".py"):
+            token = base[:-3]
+        if token is not None and by_mention(path, token):
+            continue
+        return selected, "{} changed and maps to no test module".format(path)
+    return selected, None
+
+
+def select_for_change(root, names, base=None):
+    """(selected names in tests/ order, reasons {name: [..]}, whole-suite reason or None); None if git fails."""
+    files = changed_files(root, base)
+    if files is None:
+        return None
+    sources = read_sources(root, names)
+    chosen, whole = select_changed(files, names, sources)
+    if whole:
+        return list(names), {name: [whole] for name in names}, whole
+    return [name for name in names if name in chosen], chosen, None
+
+
 def format_total(seconds):
     value = round(float(seconds), 3)
     nearest = round(value)
@@ -759,6 +866,15 @@ def parse_args(argv):
         "--print-shards", type=int, metavar="K",
         help="print K balanced shards and run nothing",
     )
+    parser.add_argument(
+        "--changed", nargs="?", const="", metavar="BASE",
+        help="only modules a change can affect (git diff BASE...HEAD, uncommitted and untracked files; "
+             "BASE defaults to the merge base with origin/master, origin/main, then HEAD~1)",
+    )
+    parser.add_argument(
+        "--print-selected", action="store_true",
+        help="with --changed: print each selected module with its reason and run nothing",
+    )
     parser.add_argument("--times", help="timing record (default: ~/.local/state/lanes/test-times.json)")
     parser.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT,
@@ -771,6 +887,8 @@ def parse_args(argv):
         parser.error("--print-shards K must be >= 1")
     if args.timeout <= 0:
         parser.error("--timeout S must be positive")
+    if args.print_selected and args.changed is None:
+        parser.error("--print-selected needs --changed")
     return args
 
 
@@ -805,6 +923,23 @@ def main(argv=None):
         return 2
     if args.windows_only:
         names = windows_modules(read_sources(root, names))
+    if args.changed is not None:
+        picked = select_for_change(root, names, args.changed or None)
+        if picked is None:
+            sys.stderr.write("run-tests: git could not list the changes for --changed\n")
+            return 2
+        names, reasons, whole = picked
+        if whole:
+            print("whole suite: {}".format(whole), flush=True)
+        if args.print_selected:
+            for name in names:
+                print("{}  {}".format(name, "; ".join(reasons.get(name, []))))
+            if not names:
+                print("no test module selected")
+            return 0
+        if not names:
+            print("run-tests: no test module is affected by the change", flush=True)
+            return 0
     times_path = args.times or default_times_path()
     record = load_times(times_path)
     sizes = module_sizes(root, names)

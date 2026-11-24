@@ -8,6 +8,7 @@
 # setup log.
 #
 # Print mode: cloud-setup --print [--repo OWNER/NAME] [--ref BRANCH] [--android] [--android-packages "PACKAGES"]
+#     [--no-tools] [--no-accept-messages] [--browsers]
 #   Prints this file with the config lines below filled in and every other line unchanged. Paste that output into the
 #   Setup script box. The repository is --repo; else the checkout recorded in ../source.json and its origin; else the
 #   origin of the git checkout holding this file. A bad value, or no repository, prints nothing and exits 2.
@@ -20,6 +21,9 @@ KIT_REF_DEFAULT=""
 KIT_PUBLIC_REPO_DEFAULT="hieunguyen7337/coding-tool-optimizer"
 ANDROID_DEFAULT=""
 ANDROID_PACKAGES_DEFAULT=""
+TOOLS_DEFAULT="1"
+ACCEPT_MESSAGES_DEFAULT="1"
+BROWSERS_DEFAULT=""
 
 ANDROID_TOOLS_VERSION="15859902"
 ANDROID_TOOLS_SHA256="4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583"
@@ -32,6 +36,10 @@ KIT_REF="${USAGE_OPTIMIZER_KIT_REF:-$KIT_REF_DEFAULT}"
 KIT_PUBLIC_REPO="${USAGE_OPTIMIZER_KIT_PUBLIC_REPO-$KIT_PUBLIC_REPO_DEFAULT}"
 ANDROID="${USAGE_OPTIMIZER_ANDROID:-$ANDROID_DEFAULT}"
 ANDROID_PACKAGES="${USAGE_OPTIMIZER_ANDROID_PACKAGES:-$ANDROID_PACKAGES_DEFAULT}"
+TOOLS="${USAGE_OPTIMIZER_TOOLS:-$TOOLS_DEFAULT}"
+ACCEPT_MESSAGES="${USAGE_OPTIMIZER_ACCEPT_MESSAGES:-$ACCEPT_MESSAGES_DEFAULT}"
+BROWSERS="${USAGE_OPTIMIZER_BROWSERS:-$BROWSERS_DEFAULT}"
+TOOLS_VENV="${USAGE_OPTIMIZER_TOOLS_VENV:-/opt/kit-venv}"
 SETUP_BUDGET="${USAGE_OPTIMIZER_SETUP_BUDGET:-270}"
 [[ "$SETUP_BUDGET" =~ ^[1-9][0-9]*$ ]] || SETUP_BUDGET=270
 SETUP_STARTED=$SECONDS
@@ -51,7 +59,7 @@ KIT_SOURCE=""
 help_text() {
   printf 'Usage: cloud-setup                              setup mode (the Setup script box runs it with no arguments)\n'
   printf '       cloud-setup --print [--repo OWNER/NAME] [--ref BRANCH] [--android]\n'
-  printf '                 [--android-packages "SDKMANAGER PACKAGES"]\n'
+  printf '                 [--android-packages "SDKMANAGER PACKAGES"] [--no-tools] [--no-accept-messages] [--browsers]\n'
   printf '                                                print this script for the Setup script box\n'
 }
 
@@ -177,7 +185,7 @@ origin_repo() {
 }
 
 print_script() {
-  local repo="$1" repo_given="$2" ref="$3" android="$4" packages="$5" line
+  local repo="$1" repo_given="$2" ref="$3" android="$4" packages="$5" tools="$6" accept="$7" browsers="$8" line
   if ((repo_given)); then
     repo="$(normal_repo "$repo")"
     if ! valid_repo "$repo"; then
@@ -208,6 +216,9 @@ print_script() {
       'KIT_REF_DEFAULT=""') line="KIT_REF_DEFAULT=\"$ref\"" ;;
       'ANDROID_DEFAULT=""') line="ANDROID_DEFAULT=\"$android\"" ;;
       'ANDROID_PACKAGES_DEFAULT=""') line="ANDROID_PACKAGES_DEFAULT=\"$packages\"" ;;
+      'TOOLS_DEFAULT="1"') line="TOOLS_DEFAULT=\"$tools\"" ;;
+      'ACCEPT_MESSAGES_DEFAULT="1"') line="ACCEPT_MESSAGES_DEFAULT=\"$accept\"" ;;
+      'BROWSERS_DEFAULT=""') line="BROWSERS_DEFAULT=\"$browsers\"" ;;
     esac
     printf '%s\n' "$line"
   done <"$SCRIPT_PATH"
@@ -353,6 +364,137 @@ swap_in() {
   return 1
 }
 
+# Runs one toolset item with a time limit; a failure is logged and never fails setup.
+tool_item() {
+  local name="$1" cap="$2" left started=$SECONDS code=0
+  shift 2
+  left="$(setup_seconds_left)"
+  if ((left < 15)); then log "tools: $name skipped: setup is near the five-minute cache limit"; return 0; fi
+  ((cap > left - 10)) && cap=$((left - 10))
+  export TOOLS_VENV
+  if declare -F "$1" >/dev/null 2>&1; then
+    run_timeout "$cap" bash -c "$(declare -f "$1"); $1" >>"$OUT_SINK" 2>&1 || code=$?
+  else
+    run_timeout "$cap" "$@" >>"$OUT_SINK" 2>&1 || code=$?
+  fi
+  if ((code == 0)); then log "tools: $name ok ($((SECONDS - started)) s)"
+  else log "tools: $name failed (exit $code, $((SECONDS - started)) s); continuing"; fi
+  return 0
+}
+
+tools_gh() {
+  mkdir -p -m 755 /etc/apt/keyrings
+  curl -fsSL --retry 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg || return 1
+  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' \
+    "$(dpkg --print-architecture)" >/etc/apt/sources.list.d/github-cli.list
+  apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/github-cli.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh
+}
+
+tools_uv() {
+  set -o pipefail
+  curl -LsSf --retry 2 https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh && return 0
+  echo "uv: astral.sh unreachable; falling back to pipx install uv (PyPI)"
+  PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install uv
+}
+
+tools_venv() {
+  python3 -m venv "$TOOLS_VENV" && "$TOOLS_VENV/bin/python" -m pip install --quiet pytest msgpack requests
+}
+
+tools_browsers() {
+  [[ -x "$TOOLS_VENV/bin/python" ]] || python3 -m venv "$TOOLS_VENV" || return 1
+  "$TOOLS_VENV/bin/python" -m pip install --quiet playwright || return 1
+  "$TOOLS_VENV/bin/python" -m playwright install --with-deps chromium
+}
+
+tools_setup() {
+  local missing=() pkg profile="${USAGE_OPTIMIZER_TOOLS_PROFILE_DIR:-/etc/profile.d}"
+  [[ "$TOOLS" == 0 ]] && return 0
+  log "tools: installing the common toolset"
+  for pkg in jq ripgrep sqlite3 python3-venv python3-pip pipx unzip zip xz-utils build-essential; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    tool_item "apt update" 120 apt-get update
+    tool_item "apt packages ${missing[*]}" 240 env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+  else
+    log "tools: apt packages already present"
+  fi
+  if command -v gh >/dev/null 2>&1; then log "tools: gh already present"
+  else tool_item gh 90 tools_gh; fi
+  if command -v uv >/dev/null 2>&1; then log "tools: uv already present"
+  else tool_item uv 60 tools_uv; fi
+  mkdir -p "$profile" 2>/dev/null
+  cat >"$profile/kit-tools.sh" 2>/dev/null <<'PROFILE'
+# Written by the kit's cloud-setup: uv, pipx and the shared venv's note.
+export PIPX_HOME="${PIPX_HOME:-/opt/pipx}" PIPX_BIN_DIR="${PIPX_BIN_DIR:-/usr/local/bin}"
+case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="/usr/local/bin:$PATH" ;; esac
+case ":$PATH:" in *:"$HOME/.local/bin":*) ;; *) PATH="$PATH:$HOME/.local/bin" ;; esac
+export PATH
+# /opt/kit-venv holds pytest, msgpack and requests for quick scripts. It is not on PATH: prefer a project's own venv
+# (uv venv; uv pip install ...), and use /opt/kit-venv/bin/python only when the project has none.
+PROFILE
+  if command -v node >/dev/null 2>&1; then tool_item corepack 30 corepack enable
+  else log "tools: corepack skipped: node is not installed"; fi
+  if [[ -x "$TOOLS_VENV/bin/pytest" ]]; then log "tools: $TOOLS_VENV already present"
+  else tool_item "shared venv $TOOLS_VENV" 90 tools_venv; fi
+  if [[ "$BROWSERS" == 1 ]]; then tool_item "playwright chromium" 240 tools_browsers; fi
+  return 0
+}
+
+accept_messages() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" code=0
+  [[ "$ACCEPT_MESSAGES" == 0 ]] && return 0
+  mkdir -p "$dir" 2>/dev/null
+  run_timeout 20 python3 -c '
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as stream:
+        data = json.load(stream)
+except FileNotFoundError:
+    data = {}
+except (json.JSONDecodeError, OSError):
+    sys.exit(3)
+if not isinstance(data, dict):
+    sys.exit(3)
+data["crossSessionInbound"] = "accept"
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(data, stream, indent=2)
+    stream.write("\n")
+os.replace(temporary, path)
+' "$dir/settings.json" >>"$OUT_SINK" 2>&1 || code=$?
+  if ((code == 0)); then log "messages: crossSessionInbound=accept set in $dir/settings.json"
+  elif ((code == 3)); then log "messages: $dir/settings.json does not parse; left unchanged"
+  else log "messages: could not update $dir/settings.json (exit $code)"; fi
+  return 0
+}
+
+version_summary() {
+  local out="" name v
+  for name in jq rg gh uv node python3 java rustc adb; do
+    command -v "$name" >/dev/null 2>&1 || continue
+    case "$name" in
+      java) v="$(java -version 2>&1 | grep -v '^Picked up' | head -n 1)" ;;
+      adb) v="$(adb version 2>&1 | grep -v '^Picked up' | head -n 1)" ;;
+      *) v="$("$name" --version 2>&1 | head -n 1)" ;;
+    esac
+    out="$out $name=${v//[$'\t\r\n']/ };"
+  done
+  log "versions:${out:- none}"
+}
+
+post_setup() {
+  accept_messages
+  tools_setup
+  android_setup
+  version_summary
+  log "setup total $((SECONDS - SETUP_STARTED)) s"
+}
+
 setup_mode() {
   local url="" public_url="" origin="" origin_safe="" code=0 install_code=0 version="unknown" found=""
   local source_ok=0 tried=0 repo_dir base label fetch_ref local_ref candidate match_path kit_path
@@ -361,10 +503,10 @@ setup_mode() {
   if { : >>"$SETUP_LOG"; } 2>/dev/null; then OUT_SINK="$SETUP_LOG"; fi
 
   if ! mkdir -p "$(dirname "$SETUP_DIR")" 2>/dev/null || [[ ! -w "$(dirname "$SETUP_DIR")" ]]; then
-    log "cannot write $(dirname "$SETUP_DIR"); the kit is not installed"; android_setup; exit 0
+    log "cannot write $(dirname "$SETUP_DIR"); the kit is not installed"; post_setup; exit 0
   fi
   if ! command -v git >/dev/null 2>&1; then
-    log "git is missing from PATH, so the kit cannot be fetched; the kit is not installed"; android_setup; exit 0
+    log "git is missing from PATH, so the kit cannot be fetched; the kit is not installed"; post_setup; exit 0
   fi
 
   KIT_REPO="$(normal_repo "$KIT_REPO")"
@@ -482,7 +624,7 @@ setup_mode() {
     fi
   fi
 
-  if ((!source_ok)); then log "no kit source was reachable; the kit is not installed"; android_setup; exit 0; fi
+  if ((!source_ok)); then log "no kit source was reachable; the kit is not installed"; post_setup; exit 0; fi
 
   # The limits total at most 280 s (40 + 2 x 40 + 40 + 120), including each origin lookup. Source 4 is skipped
   # unless its 40 + 120 s remain in SETUP_BUDGET.
@@ -494,11 +636,11 @@ setup_mode() {
   fi
   if ((install_code == 0)); then log "kit version $version from $KIT_SOURCE; install.sh exit 0"
   else log "kit version $version from $KIT_SOURCE; install.sh exit $install_code; its output is in $SETUP_LOG"; fi
-  android_setup; exit 0
+  post_setup; exit 0
 }
 
 main() {
-  local print=0 repo="" repo_given=0 ref="" android="" packages=""
+  local print=0 repo="" repo_given=0 ref="" android="" packages="" tools=1 accept=1 browsers=""
   if (($# == 0)); then
     setup_mode
     exit 0
@@ -511,6 +653,18 @@ main() {
         ;;
       --android)
         android=1
+        shift
+        ;;
+      --no-tools)
+        tools=0
+        shift
+        ;;
+      --no-accept-messages)
+        accept=0
+        shift
+        ;;
+      --browsers)
+        browsers=1
         shift
         ;;
       --android-packages)
@@ -550,7 +704,7 @@ main() {
     usage
     exit 2
   fi
-  print_script "$repo" "$repo_given" "$ref" "$android" "$packages"
+  print_script "$repo" "$repo_given" "$ref" "$android" "$packages" "$tools" "$accept" "$browsers"
   exit 0
 }
 

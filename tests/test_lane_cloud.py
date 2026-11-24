@@ -120,6 +120,7 @@ class LaneCloudTests(unittest.TestCase):
                         body = "Fake report line\\n# Kept heading\\n"
                         if mode == "subagents":
                             body = "Fake report line\\nSubagents: 3\\n- read files\\n"
+                        body += os.environ.get("FAKE_REPORT_EXTRA", "")
                         report = os.path.join(os.environ["FAKE_TMP"], "report-" + run_id + ".md")
                         with open(report, "w", encoding="utf-8") as stream:
                             stream.write(done + "\\n\\n" + body)
@@ -1105,6 +1106,127 @@ class LaneCloudTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--verify needs --cloud", result.stderr)
         self.assertEqual(self.remote_refs(), {})
+
+    # ----- --bisect GOOD_REF on a verify run -----
+
+    def commit_on_workspace(self, name, text, message):
+        self.write(os.path.join(self.workspace, name), text)
+        self.git("-C", self.workspace, "add", name)
+        self.git("-C", self.workspace, "-c", "user.name=Lane Test", "-c", "user.email=lane-test@localhost",
+                 "commit", "-m", message)
+        return self.git("-C", self.workspace, "rev-parse", "HEAD").stdout.decode("ascii").strip()
+
+    def test_bisect_needs_cloud_verify_and_a_ref(self):
+        result = self.run_lane(extra=["--cloud", "--bisect", "HEAD", "--dry-run"])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--bisect needs --cloud --verify", result.stderr)
+        result = self.run_lane(extra=["--bisect", "HEAD", "--dry-run"])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        result = self.run_lane(extra=["--cloud", "--verify", "--bisect=--all", "--dry-run"])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--bisect needs a git ref", result.stderr)
+        self.assertEqual(self.remote_refs(), {})
+
+    def test_bisect_refuses_a_good_ref_that_is_not_an_older_ancestor(self):
+        self.git("-C", self.workspace, "branch", "side")
+        tested = self.commit_on_workspace("tested.txt", "tested\n", "tested")
+        self.git("-C", self.workspace, "checkout", "-q", "side")
+        side = self.commit_on_workspace("side.txt", "side\n", "side work")
+        self.git("-C", self.workspace, "checkout", "-q", "main")
+        cases = (("no-such-ref", "is not a commit"), (side, "is not an ancestor of the tested commit " + tested),
+                 ("HEAD", "is the tested commit"), (tested[:12], "is the tested commit"))
+        for ref, message in cases:
+            result = self.run_lane(extra=["--cloud", "--verify", "--bisect", ref, "--outdir", self.outdir])
+            self.assertEqual(result.returncode, 2, ref + ": " + result.stderr + result.stdout)
+            self.assertIn(message, result.stderr)
+            self.assertEqual(self.remote_refs(), {})
+            self.assertFalse(os.path.exists(self.outdir))
+
+    def test_bisect_dry_run_puts_both_full_shas_in_the_serial_and_the_sharded_prompt(self):
+        tested = self.commit_on_workspace("tested.txt", "tested\n", "tested")
+        for shards in ("off", "on"):
+            result = self.run_lane(extra=["--cloud", "--verify", "--bisect", "HEAD~1", "--dry-run"],
+                                   env={"LANES_VERIFY_SHARDS": shards})
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("bisect: good {} tested {}".format(self.base_sha, tested), result.stdout)
+            launch = json.loads(next(line for line in result.stdout.splitlines()
+                                     if line.startswith("launch: "))[len("launch: "):])
+            prompt = launch[launch.index("--cloud") + 1]
+            self.assertIn("   git bisect start {} {}\n".format(tested, self.base_sha), prompt)
+            self.assertIn("   git bisect run sh -c '<that command>'\n", prompt)
+            self.assertIn("   BISECT first bad: <full sha> <subject>\n", prompt)
+            self.assertIn("   BISECT inconclusive: <one-line reason>\n", prompt)
+            self.assertIn("then run git bisect reset", prompt)
+            # The bisect step closes step 2, before the done marker step.
+            self.assertLess(prompt.index("2b. Bisect."), prompt.index("3. As your very last step"))
+            self.assertEqual("shard" in prompt.split("2b. Bisect.")[0], shards == "on")
+        # Without --bisect the verify prompt has no bisect step.
+        result = self.run_lane(extra=["--cloud", "--verify", "--dry-run"])
+        self.assertNotIn("bisect", result.stdout.lower())
+
+    def test_bisect_prompt_matches_the_step_and_changes_nothing_else(self):
+        lane = self.lane_module()
+        for shards in ("off", "on"):
+            with mock.patch.dict(os.environ, {"LANES_VERIFY_SHARDS": shards}):
+                plain = lane.claude_cloud_prompt("Brief.", "run-1", "sonnet", True, "default", shards=[["tests.a"]])
+                bisect = lane.claude_cloud_prompt("Brief.", "run-1", "sonnet", True, "default", shards=[["tests.a"]],
+                                                  bisect=("b" * 40, "a" * 40))
+            step = lane.BISECT_STEP.format(tested="b" * 40, good="a" * 40)
+            self.assertEqual(bisect.replace(step, ""), plain)
+            self.assertIn("\n" + step + "3. As your very last step", bisect)
+        # A worker prompt ignores bisect: only a verify run bisects.
+        self.assertNotIn("bisect", lane.claude_cloud_prompt("Brief.", "run-1", "sonnet", False).lower())
+
+    def test_bisect_result_reads_the_last_bisect_line_and_skips_the_template(self):
+        lane = self.lane_module()
+        good = "a" * 40
+        bad = "c" * 40
+        self.assertIsNone(lane.bisect_result("all commands exited 0\n", good))
+        self.assertIsNone(lane.bisect_result("BISECT first bad: <full sha> <subject>\n"
+                                             "BISECT inconclusive: <one-line reason>\n", good))
+        report = ("Quoted: BISECT first bad: <full sha> <subject>\n"
+                  "BISECT first bad: {} Break the parser\n".format(bad.upper()))
+        self.assertEqual(lane.bisect_result(report, good),
+                         {"good": good, "first_bad": bad, "subject": "Break the parser"})
+        self.assertEqual(lane.bisect_result("    `BISECT first bad: {} fix: it`\n".format(bad), good),
+                         {"good": good, "first_bad": bad, "subject": "fix: it"})
+        self.assertEqual(lane.bisect_result("BISECT first bad: {}\nBISECT inconclusive: the good commit fails "
+                                            "too\n".format(bad), good),
+                         {"good": good, "inconclusive": "the good commit fails too"})
+
+    def test_bisect_verify_run_records_the_first_bad_commit(self):
+        tested = self.commit_on_workspace("tested.txt", "tested\n", "tested")
+        bad = "d" * 40
+        result = self.run_lane(extra=["--cloud", "--verify", "--bisect", self.base_sha[:10], "--outdir", self.outdir],
+                               env={"FAKE_CLAUDE_MODE": "verify-partial",
+                                    "FAKE_REPORT_EXTRA": "BISECT first bad: {} Break the suite\n".format(bad)})
+        self.assertEqual(result.returncode, 6, result.stderr + result.stdout)
+        self.assertIn("BISECT first bad: " + bad, result.stdout)
+        meta = self.read_json(os.path.join(self.outdir, "meta.json"))
+        self.assertEqual(meta["cloud"]["bisect"], {"good": self.base_sha, "first_bad": bad,
+                                                   "subject": "Break the suite"})
+        self.assertEqual(meta["cloud"]["bisect_good"], self.base_sha)
+        prompt = self.cloud_prompt(meta)
+        self.assertIn("git bisect start {} {}".format(tested, self.base_sha), prompt)
+        self.assertEqual(self.git("-C", self.workspace, "status", "--porcelain").stdout, b"")
+        self.assertEqual(self.remote_refs(), {})
+
+    def test_bisect_verify_run_records_an_inconclusive_bisect_and_no_key_without_a_line(self):
+        self.commit_on_workspace("tested.txt", "tested\n", "tested")
+        result = self.run_lane(extra=["--cloud", "--verify", "--bisect", "HEAD~1", "--outdir", self.outdir],
+                               env={"FAKE_CLAUDE_MODE": "verify-partial",
+                                    "FAKE_REPORT_EXTRA": "BISECT inconclusive: a commit could not be tested\n"})
+        self.assertEqual(result.returncode, 6, result.stderr + result.stdout)
+        meta = self.read_json(os.path.join(self.outdir, "meta.json"))
+        self.assertEqual(meta["cloud"]["bisect"], {"good": self.base_sha,
+                                                   "inconclusive": "a commit could not be tested"})
+        outdir = os.path.join(self.root, "passing")
+        result = self.run_lane(extra=["--cloud", "--verify", "--bisect", "HEAD~1", "--outdir", outdir],
+                               env={"FAKE_CLAUDE_MODE": "verify"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        meta = self.read_json(os.path.join(outdir, "meta.json"))
+        self.assertNotIn("bisect", meta["cloud"])
+        self.assertEqual(meta["cloud"]["bisect_good"], self.base_sha)
 
     def test_claude_missing_start_marker_fails_and_cleans_up(self):
         result = self.run_lane(extra=["--cloud", "--outdir", self.outdir], env={"FAKE_CLAUDE_MODE": "no-start"})

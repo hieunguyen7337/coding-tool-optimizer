@@ -17,6 +17,7 @@ until kit 2026-10-16.1. muse was retired on 2026-10-17.)
 lane-stats pick --class <class> [--pair] [--exclude <lanes>] [--include <lanes>] [--place <process|subagent|cloud>] [--dir <abs dir>] [--brief <file>] [--seed N] [--no-usage] [--json]
 lane-stats review <run|last> --outcome accepted|fixed|rework|rejected [--fix-minutes N] [--note <text>] [--findings APPLIED/TOTAL]
 lane-stats reviewers [--json] [--min-findings N]
+lane-stats risk [--base REF] [--dir DIR] [--json]
 lane-stats report [--by lane,effort,class] [--since YYYY-MM-DD] [--json]
 lane-stats recommend [--class C] [--since YYYY-MM-DD] [--json]
 lane-stats arms [--discover]
@@ -189,6 +190,22 @@ an empty one is the normal case (OK, or PARTIAL from the marker, never NOOP), an
 and the ledger get `"verify": true`. A verify run is not a unit and is never reviewed: `lane-stats` (pick, recommend,
 report, eta, review) and turn-meter's "Finished, not reviewed" list skip it, while its spend still counts in
 turn-meter's cost totals. `--verify` without `--cloud`, or with a Codex lane, exits 2.
+`tools/push-guard.py` is a git `pre-push` hook (no model, no tokens): a push to `master` or `main` (override with
+`git config kit.pushGuard.branches "a b"`) passes only when a verify run in `runs/*/meta.json` (from any worktree) has
+`cloud.base` equal to the full pushed sha, `verdict` `OK`, and a report whose every `exit code: N` is 0. Install it with
+`tools/push-guard.py --install-hook <repo>` (it will not overwrite a different hook and prints how to chain it); scripts
+use `tools/push-guard.py --check <sha> [-C repo]`. `KIT_PUSH_GUARD=off` pushes anyway with a warning and a
+`[push-guard off]` line in `lead-log.md`.
+`--bisect GOOD_REF` (from 2026-11-24, only with `--cloud --verify`; otherwise exit 2) adds a last part to step 2, in
+the serial and the sharded form: only if some command exited non-zero, the session takes the first one that did (a
+shard counts as its own command), unshallows its clone if needed, runs `git bisect start <tested sha> <good sha>` and
+`git bisect run sh -c '<that command>'`, prints exactly one line `BISECT first bad: <sha> <subject>` (or `BISECT
+inconclusive: <reason>`) into the report, then `git bisect reset`; it still changes and commits nothing else, and
+bisect does not count in the PARTIAL subject. `lane` resolves GOOD_REF to a full sha in the local checkout before
+anything is pushed and refuses (exit 2) a ref that is no commit, is the tested commit (the pushed `HEAD`), or is not
+its ancestor. `meta.json` gets `cloud.bisect_good`, and, when the report has the line (the last one counts),
+`cloud.bisect` = `{"good", "first_bad", "subject"}` or `{"good", "inconclusive"}`; a run whose commands all pass has
+no `cloud.bisect`. Claude then reads one commit (`git show <first_bad>`) instead of a whole log.
 Each provider (claude, codex, gemini) has a usage mode, `saving`, `default` or `utilization` (from 2026-10-31.8). The
 setting is the first of `USAGE_OPTIMIZER_MODE`, the first word of `~/.config/lanes/mode` (the folder `LANES_CONFIG`
 names, as for `cloud.json`) and `explore.mode` in `arms.json` (shipped `auto` from 2026-10-31.12, `utilization` from .8 to .11); any other value warns and
@@ -222,6 +239,18 @@ the counts add up. `lane-stats` prices a provider's runs by its mode
 - Facts behind the design (research note §7–§8): `--model` reaches the session; a session seeded from a bundle
   (only while the App is missing) cannot push, and neither `--teleport` nor `claude -p --cloud <id>` (it only queues a follow-up) returns its work;
   `stream-json` is refused for cloud follow-ups.
+- `lane cloud-send <run-id|last|session_...> (-m TEXT | -f FILE)` (from 2026-11-24) queues a follow-up in a run's
+  cloud session: `claude -p "<text>" --cloud <session id> --output-format json`, with no terminal, a 120 s timeout,
+  and the `claude` the launch uses (`LANES_CLAUDE_BIN`, `<config>/bin`, then PATH). The session id comes from the
+  run's `meta.json` (`cloud.session_id`; `last` is the newest Claude cloud run by `started_at`), or a `session_...` /
+  `cse_...` id is taken as given (and recorded in the newest run with that session, if any). It prints `ok:` and
+  `url:` from the JSON answer and appends `{"at", "bytes", "ok", "first_line"}` to `cloud.sent` in that `meta.json`
+  (the text's first non-empty line, at most 80 characters; the text itself is never printed or stored), carried over
+  when a still-running `lane` rewrites the file. Exit 0 when `claude` answered `"ok": true`, 1 otherwise, 2 for a
+  usage error (no or empty text, both `-m` and `-f`, an unknown run, a run without a Claude session). Why: a peer
+  message from the owner's local session (bypass mode) to a cloud session (auto mode) is held for approval because
+  the modes differ, but a follow-up sent through the owner's own CLI is the owner's message and is delivered. The
+  answer still comes back through git or the app, so a brief stays self-contained (below).
 - Nothing steers a running session from here (a peer session, 2026-10-31; inferred, not proven). A peer message
   (`SendMessage`) to a session in another permission mode is held for that session's user to approve, and a local
   lead in bypass mode and a cloud session in auto mode differ: the lead's messages reported success, yet none
@@ -372,6 +401,17 @@ first turn; a kit installed after start was not picked up until settings were wr
 `.claude/settings.local.json` (observed on 2026-10-31). Not yet known: whether git can reach a private kit repository
 during the setup script, and whether the project clone exists yet when it runs. The log of the first session that uses
 the script answers both.
+
+**A toolset and cross-session messages (from 2026-11-24).** The printed script also installs, each item skipped when
+present and each failure logged without failing setup (`--no-tools` skips all): apt `jq ripgrep sqlite3 python3-venv
+python3-pip pipx unzip zip xz-utils build-essential`, `gh` (GitHub's apt repository), `uv` (Astral's installer, in
+`/usr/local/bin`), `corepack enable` when `node` exists, and a shared venv `/opt/kit-venv` with `pytest msgpack
+requests` (not on PATH; `/etc/profile.d/kit-tools.sh` says projects should prefer their own venv with `uv`).
+`--browsers` adds Playwright's Chromium with OS dependencies through that venv. Unless `--no-accept-messages`, it merges
+`"crossSessionInbound": "accept"` into `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json` so a cloud session accepts
+messages from the owner's own other sessions instead of holding them for approval (the key and its `accept`/`hold`
+values are in Claude Code 2.1.331). The log ends with a `versions:` line (`jq rg gh uv node python3 java rustc adb`)
+and `setup total N s`; the kit's cloud canary reads it.
 
 **Android builds (from 2026-11-01.4).** `cloud-setup --print --android` prints a script that also installs the Android
 command-line tools (version 15859902, SHA-256 checked against developer.android.com), accepts the SDK licences,
@@ -781,6 +821,15 @@ runs) and never counts as agreement. One review at a time per workdir.
   `arms.local.json` (`{"plan": "max_5x", "from": "2026-11-13T12:42:39Z"}`): a run without its own plan is on the plan in force at its
   time, today's plan is the latest change, and `prior_plan` stays the plan the priors were written for. `turn-meter`
   shows today's plan by its `plan_prices.<plan>.name` and calibrates only from readings after the latest change.
+
+## Test runner (`tools/run-tests.py`)
+
+- `tools/run-tests.py --changed [BASE]` runs only the `tests/test_*.py` modules a change can affect (`git diff BASE...HEAD`
+  plus uncommitted and untracked files under `bin/`, `tools/`, `tests/`; BASE defaults to the merge base with `origin/master`,
+  then `origin/main`, then `HEAD~1`): a changed test module selects itself, a changed `bin/<tool>`, `tools/<name>.py`,
+  `tests/fake_*.py`, fixture or doc selects the modules whose source mentions it (a doc with no mention selects nothing), and
+  any other file (`install.sh`, `arms.json`, `lib/`) selects the whole suite. `--changed BASE --print-selected` prints each
+  module with its reason and runs nothing. Use it before a merge; the full suite runs once in the cloud shards before a release.
 
 ## Kit update (`kit-update`)
 

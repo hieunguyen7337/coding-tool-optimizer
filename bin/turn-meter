@@ -16,6 +16,7 @@ import uuid
 
 
 UTC = dt.timezone.utc
+OPEN_STALE_HOURS = 24  # an open turn older than this is a session that never ran its Stop hook
 PROVIDERS = ("claude", "codex", "gemini")
 # The platforms a turn can come from. Claude Code is the default and its turns carry no platform fields.
 PLATFORMS = ("claude-code", "amp", "codex")
@@ -1727,6 +1728,17 @@ def _choose_open(state, session_id):
             opened.append(value)
     if session_id:
         return next((item for item in opened if item.get("session_id") == session_id), None)
+    # Claude Code exports its own session id to every Bash call; it beats guessing by folder, where a
+    # session that ended without its Stop hook can leave an open turn behind for days (2026-11-20: a
+    # `cd ~` reported an 11-11 turn of 221 h).
+    own = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if own:
+        mine = next((item for item in opened if item.get("session_id") == own), None)
+        if mine:
+            return mine
+    cutoff = dt.datetime.now(UTC) - dt.timedelta(hours=OPEN_STALE_HOURS)
+    fresh = [item for item in opened if (_time(item.get("started_at")) or cutoff) > cutoff]
+    opened = fresh or opened
     cwd = os.path.realpath(os.getcwd())
     matching = [item for item in opened if isinstance(item.get("cwd"), str) and os.path.realpath(item["cwd"]) == cwd]
     candidates = matching or opened

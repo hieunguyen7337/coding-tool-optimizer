@@ -58,7 +58,8 @@ class CloudSetupTests(unittest.TestCase):
         env.update({"HOME": self.home, "USERPROFILE": self.home, "USAGE_OPTIMIZER_SKIP_CLI_CHECK": "1",
                     "USAGE_OPTIMIZER_SETUP_DIR": self.setup_dir, "USAGE_OPTIMIZER_SETUP_LOG": self.log,
                     "USAGE_OPTIMIZER_SETUP_REPOS": self.repos,
-                    "USAGE_OPTIMIZER_KIT_PUBLIC_REPO": "off"})
+                    "USAGE_OPTIMIZER_KIT_PUBLIC_REPO": "off",
+                    "USAGE_OPTIMIZER_TOOLS": "0", "USAGE_OPTIMIZER_ACCEPT_MESSAGES": "0"})
         env.update(extra or {})
         return env
 
@@ -148,6 +149,64 @@ class CloudSetupTests(unittest.TestCase):
         result = subprocess.run([BASH, "-n", SCRIPT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 encoding="utf-8", timeout=60, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_printed_script_stays_under_64_kb_and_flags_fill_defaults(self):
+        result = self.run_script(["--print", "--repo", "o/n", "--android", "--browsers"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(len(result.stdout.encode("utf-8")), 65536)
+        self.assertIn('TOOLS_DEFAULT="1"', result.stdout)
+        self.assertIn('BROWSERS_DEFAULT="1"', result.stdout)
+        result = self.run_script(["--print", "--repo", "o/n", "--no-tools", "--no-accept-messages"])
+        self.assertIn('TOOLS_DEFAULT="0"', result.stdout)
+        self.assertIn('ACCEPT_MESSAGES_DEFAULT="0"', result.stdout)
+        self.assertIn('BROWSERS_DEFAULT=""', result.stdout)
+
+    def fake_tool_path(self, log):
+        fakebin = os.path.join(self.temp.name, "toolbin")
+        os.makedirs(fakebin)
+        for name in ("apt-get", "curl", "dpkg", "uv", "gh"):
+            path = os.path.join(fakebin, name)
+            with open(path, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write('#!/bin/sh\necho %s "$@" >>"$COMMAND_LOG"\n[ %s = dpkg ] && exit 1\nexit 0\n' % (name, name))
+            os.chmod(path, 0o755)
+        return {"PATH": fakebin + os.pathsep + os.environ["PATH"], "COMMAND_LOG": log}
+
+    def test_no_tools_installs_nothing_and_default_tools_run_and_are_nonfatal(self):
+        kit = self.make_kit(os.path.join(self.temp.name, "kit"))
+        log = os.path.join(self.temp.name, "commands.log")
+        extra = self.fake_tool_path(log)
+        extra.update({"USAGE_OPTIMIZER_KIT_URL": kit, "USAGE_OPTIMIZER_TOOLS": "0",
+                      "USAGE_OPTIMIZER_TOOLS_PROFILE_DIR": os.path.join(self.temp.name, "profile.d"),
+                      "USAGE_OPTIMIZER_TOOLS_VENV": os.path.join(self.temp.name, "venv")})
+        result = self.run_script(env_extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as stream:
+                self.assertNotIn("apt-get", stream.read())
+        self.assertNotIn("tools:", result.stdout)
+        extra["USAGE_OPTIMIZER_TOOLS"] = "1"
+        result = self.run_script(env_extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(log, encoding="utf-8") as stream:
+            commands = stream.read()
+        self.assertIn("apt-get install -y --no-install-recommends jq ripgrep sqlite3 python3-venv python3-pip pipx unzip zip xz-utils build-essential", commands)
+        self.assertIn("tools: apt packages", result.stdout)
+        self.assertIn("versions:", result.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.temp.name, "profile.d", "kit-tools.sh")))
+
+    def test_accept_messages_merges_the_key_and_keeps_other_keys(self):
+        kit = self.make_kit(os.path.join(self.temp.name, "kit"))
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(settings), exist_ok=True)
+        with open(settings, "w", encoding="utf-8") as stream:
+            json.dump({"autoCompactWindow": 250000, "env": {"A": "1"}}, stream)
+        result = self.run_script(env_extra={"USAGE_OPTIMIZER_KIT_URL": kit, "USAGE_OPTIMIZER_ACCEPT_MESSAGES": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(settings, encoding="utf-8") as stream:
+            data = json.load(stream)
+        self.assertEqual(data["crossSessionInbound"], "accept")
+        self.assertEqual(data["env"]["A"], "1")
+        self.assertEqual(data["autoCompactWindow"], 250000)
 
     # (b) --print fills both config lines and changes nothing else
     def test_print_fills_both_lines_and_keeps_the_rest(self):

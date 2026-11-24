@@ -310,6 +310,16 @@
     }
   },
   "explore": {
+    "review_risk": {
+      "about": "lane-stats risk: any changed file matching deep is a deep review; all documentation (light) or comment-only code is light; the rest is normal. A repository adds its own in .review-risk.json: {\"deep\": [], \"light\": []}.",
+      "deep": [
+        "install.sh", "bin/lane-mask", "bin/cloud-setup", "bin/kit-update", "tools/publish-public.py",
+        "tools/release_bundle.py", "tools/make-bundle.sh", "tools/push-guard.py", ".github/**",
+        "**/*secret*", "**/*credential*", "**/*auth*", "**/*payment*", "**/*billing*", "**/auth/**",
+        "**/payments/**", "**/billing/**", "**/migrations/**", "**/*.sql", ".env*"
+      ],
+      "light": ["*.md", "*.txt", "docs/**", "findings/**", "LICENSE*", "CHANGELOG*"]
+    },
     "default_exclude": [
       "gemini",
       "grok"

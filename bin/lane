@@ -1005,6 +1005,26 @@ def cloud_preflight(lane_name, path):
             "remote_existed": existed, "env": env_label}
 
 
+def cloud_bisect_good(path, good_ref, tested):
+    """Resolve --bisect GOOD_REF to a full sha in the local checkout and check it is an older ancestor of tested.
+
+    Why: the session bisects between the two, and `git bisect start <bad> <good>` with a good commit that is not an
+    ancestor makes git test merge bases first and answer about commits outside the tested history."""
+    resolved = cloud_preflight_git(path, ["rev-parse", "--verify", "--quiet", good_ref + "^{commit}"])
+    good = cloud_output(resolved)
+    if resolved.returncode or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", good):
+        raise LaneError("--bisect: {} is not a commit in {}".format(good_ref, path), 2)
+    if good == tested:
+        raise LaneError("--bisect: {} is the tested commit {}; name an older commit that passes".format(
+            good_ref, tested), 2)
+    ancestor = cloud_preflight_git(path, ["merge-base", "--is-ancestor", good, tested])
+    if ancestor.returncode == 1:
+        raise LaneError("--bisect: {} ({}) is not an ancestor of the tested commit {}".format(good_ref, good, tested), 2)
+    if ancestor.returncode:
+        raise LaneError("--bisect: cannot check that {} is an ancestor of {}".format(good, tested), 8)
+    return good
+
+
 def cloud_run_component(run_id):
     if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id) and ".." not in run_id and not run_id.endswith("."):
         return run_id
@@ -1279,7 +1299,9 @@ def lane_term_path():
 VERIFY_STEP = (
     '2. Run each command the brief lists, from the repository root, in order, with the brief\'s timeouts. Do not\n'
     '   edit, create or delete tracked files, and commit nothing but the two lane markers. The report holds, per\n'
-    '   command, the command, its exit code and the last 40 lines of its combined output verbatim. If every command\n'
+    '   command, the command, its exit code and the last 40 lines of its combined output verbatim.\n'
+    '   End the report with one line per command in the form EXIT <exit code> <command>, and start no other\n'
+    '   line with EXIT: the push guard reads these lines. If every command\n'
     '   exited 0 the done subject is "lane: done {}"; otherwise it is\n'
     '   "lane: done {} PARTIAL: <k> of <n> commands failed".\n')
 
@@ -1371,9 +1393,29 @@ PARALLEL_VERIFY_STEP = (
     '   counts add up to the whole suite. Do not edit, create or delete tracked files, and commit nothing but the two\n'
     '   lane markers. The report holds, per command, and per shard as its own command in place of the command it\n'
     '   splits, its command line, its exit code and the last 40 lines of its combined output verbatim, and for each\n'
-    '   shard the list of files it ran.\n'
+    '   shard the list of files it ran. End the report with one line per command, each shard counting as one, in\n'
+    '   the form EXIT <exit code> <command>, and start no other line with EXIT: the push guard reads these lines.\n'
     '   If every command exited 0 the done subject is "lane: done {}"; otherwise it is\n'
     '   "lane: done {} PARTIAL: <k> of <n> commands failed", where each shard counts as a command.\n')
+
+
+# The last part of step 2 of a --verify --bisect run (serial and sharded): bisect the first failing command between
+# GOOD_REF and the tested commit, so the caller reads one commit instead of a whole log. Lane parses the BISECT line
+# from the report into cloud.bisect. No braces here: the step is formatted with the run id once more.
+BISECT_STEP = (
+    '2b. Bisect. Only if some command above exited non-zero: take the first one that did (a shard counts as its own\n'
+    '   command, with its own command line). If git rev-parse --is-shallow-repository prints true, first run\n'
+    '   git fetch --unshallow origin, so the good commit is in the clone. Then run, from the repository root:\n'
+    '   git bisect start {tested} {good}\n'
+    "   git bisect run sh -c '<that command>'\n"
+    '   with the command quoted for sh, then print exactly one line and copy it into the report on a line of its own:\n'
+    '   BISECT first bad: <full sha> <subject>\n'
+    '   or, when bisect cannot name one first bad commit (a skipped or untestable commit, the good commit failing\n'
+    '   too, an error),\n'
+    '   BISECT inconclusive: <one-line reason>\n'
+    '   then run git bisect reset, so the checkout is back on the tested commit. Bisect is not one of the brief\'s\n'
+    '   commands and does not count in <k> of <n>; it edits no tracked file and commits nothing. When every command\n'
+    '   exited 0, skip this step and print no BISECT line.\n')
 
 
 # Step 2 of a normal cloud run: the VM has room, and a subagent keeps file dumps out of the main context.
@@ -1466,7 +1508,9 @@ def verify_sharded():
     return os.environ.get("LANES_VERIFY_SHARDS", "").strip().lower() not in ("off", "0", "no", "serial", "false")
 
 
-def claude_cloud_prompt(sent_text, run_id, alias, verify=False, mode="default", shards=None, title=None):
+def claude_cloud_prompt(sent_text, run_id, alias, verify=False, mode="default", shards=None, title=None,
+                        bisect=None):
+    """bisect, only with verify, is (tested sha, good sha): step 2 then ends with BISECT_STEP."""
     if verify:
         sharded = verify_sharded()
         step2 = (PARALLEL_VERIFY_STEP if sharded else VERIFY_STEP).format(run_id, run_id)
@@ -1484,6 +1528,8 @@ def claude_cloud_prompt(sent_text, run_id, alias, verify=False, mode="default", 
                 "   RUN value if the brief's suite command uses another runner. LOG_DIR may name a directory of your\n"
                 "   own, if it stays absolute and outside the repository.\n" + placeholder_note
                 + "BEGIN\n" + script.replace("{", "{{").replace("}", "}}") + "END\n")
+        if bisect:
+            step2 += BISECT_STEP.format(tested=bisect[0], good=bisect[1])
     else:
         step2 = {"utilization": UTILIZATION_STEP, "saving": SAVING_STEP}.get(mode, SUBAGENT_STEP).format(alias)
     # A verify report is the commands' verbatim output, which a subagent's summary would paraphrase.
@@ -1511,14 +1557,14 @@ SETTLE_KEYS = "left," * 7
 
 
 def claude_cloud_command(executable, term, path, prefix, sent_text, run_id, model, effort, verify=False, alias=None,
-                         mode="default", prompt=None, title=None):
+                         mode="default", prompt=None, title=None, bisect=None):
     # alias is the lane name; without it, take it from the model id (claude-haiku-5-5 -> haiku).
     alias = alias or next((name for name in CLAUDE_LANES if name in model), "sonnet")
     # `lane main` passes its own prompt (MAIN_HEAD and the policy), not a worker's.
     if prompt is None:
         prompt = claude_cloud_prompt(sent_text, run_id, alias, verify, mode,
                                      shards=verify_shards(path) if verify and verify_sharded() else None,
-                                     title=title)
+                                     title=title, bisect=bisect if verify else None)
     claude_argv = launch_prefix(executable or "claude")
     return [sys.executable, term, "--out", prefix, "--cwd", path, "--max", "180",
             "--answer", "Yes, I trust this folder=" + SETTLE_KEYS + "down,enter",
@@ -1549,7 +1595,10 @@ def cloud_dry_run(opts, path, outdir, sent_text, sent_bytes, model, effort, exec
         prefix = os.path.join(outdir, "cloud-screen")
         launch = claude_cloud_command(executable, term, path, prefix, sent_text, run_id, model, effort,
                                       opts.verify, opts.lane, mode,
-                                      title=cloud_run_title(opts, path, outdir, plan, side_reason))
+                                      title=cloud_run_title(opts, path, outdir, plan, side_reason),
+                                      bisect=plan.get("bisect"))
+        if plan.get("bisect"):
+            print("bisect: good {} tested {}".format(plan["bisect"][1], plan["bisect"][0]))
         print("launch: {}".format(json.dumps(launch, ensure_ascii=False)))
         print("poll: {} every {} seconds until lane: start/done markers".format(
             json.dumps(["git", "-C", path, "ls-remote", "origin", "refs/heads/*"]),
@@ -1607,6 +1656,37 @@ def cloud_ref_head(path, ref, deadline=None):
     return (sha, subject) if sha else None
 
 
+def claude_cloud_child_env():
+    """The environment for a `claude` that talks to a cloud session: this session's CLAUDECODE and CLAUDE_CODE_*
+    markers removed (the OAuth token kept), and auto memory off."""
+    child_env = {name: value for name, value in os.environ.items()
+                 if name.upper() == "CLAUDE_CODE_OAUTH_TOKEN"
+                 or (name.upper() != "CLAUDECODE" and not name.upper().startswith("CLAUDE_CODE_"))}
+    child_env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return child_env
+
+
+BISECT_FIRST_BAD_RE = re.compile(r"^[ \t>*`-]*BISECT first bad: ([0-9a-fA-F]{7,64})(?:[ \t]+(.*?))?[`*\s]*$", re.MULTILINE)
+BISECT_INCONCLUSIVE_RE = re.compile(r"^[ \t>*`-]*BISECT inconclusive:[ \t]*(.*?)[`*\s]*$", re.MULTILINE)
+
+
+def bisect_result(report, good):
+    """The BISECT line of a --bisect verify report as cloud.bisect, or None when the report has none.
+
+    {"good", "first_bad", "subject"} for `BISECT first bad: <sha> <subject>`, {"good", "inconclusive"} for
+    `BISECT inconclusive: <reason>`. The last such line wins: the report may quote the prompt's template first.
+    A line still holding the template's <full sha> is not a result."""
+    found = []
+    for match in BISECT_FIRST_BAD_RE.finditer(report or ""):
+        found.append((match.start(), {"good": good, "first_bad": match.group(1).lower(),
+                                      "subject": (match.group(2) or "").strip()}))
+    for match in BISECT_INCONCLUSIVE_RE.finditer(report or ""):
+        reason = match.group(1).strip()
+        if reason and reason != "<one-line reason>":
+            found.append((match.start(), {"good": good, "inconclusive": reason}))
+    return max(found, key=lambda item: item[0])[1] if found else None
+
+
 def run_claude_cloud(opts, path, outdir, sent_text, model, effort, executable, plan,
                      meta, meta_path, log_path):
     run_id = os.path.basename(os.path.normpath(outdir))
@@ -1625,7 +1705,8 @@ def run_claude_cloud(opts, path, outdir, sent_text, model, effort, executable, p
             raise LaneError("lane-term was not found at {}; install bin/lane-term or set LANES_TERM".format(term), 4, "FAILED")
         command = claude_cloud_command(executable, term, path, prefix, sent_text, run_id, model, effort,
                                        opts.verify, opts.lane, meta.get("mode") or "default",
-                                       title=cloud_run_title(opts, path, outdir, plan, cloud.get("side_reason")))
+                                       title=cloud_run_title(opts, path, outdir, plan, cloud.get("side_reason")),
+                                       bisect=plan.get("bisect"))
         if IS_WINDOWS and windows_command_line_length(command) > WINDOWS_COMMAND_LINE_LIMIT:
             raise LaneError("the command line exceeds the Windows limit of 32,767 characters; a Claude cloud run passes "
                             "the brief as an argument, so shorten the brief or use codex-cloud", 8)
@@ -1634,11 +1715,7 @@ def run_claude_cloud(opts, path, outdir, sent_text, model, effort, executable, p
         cloud_push_branch(path, plan, deadline, run_id)
         base_pushed = True
         before_refs = cloud_remote_refs(path, deadline)
-        source_env = os.environ
-        child_env = {name: value for name, value in source_env.items()
-                     if name.upper() == "CLAUDE_CODE_OAUTH_TOKEN"
-                     or (name.upper() != "CLAUDECODE" and not name.upper().startswith("CLAUDE_CODE_"))}
-        child_env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        child_env = claude_cloud_child_env()
         mark_launched(meta, meta_path)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1758,6 +1835,10 @@ def run_claude_cloud(opts, path, outdir, sent_text, model, effort, executable, p
                     found = re.search(r"^Subagents:\s*(\d+)", report, re.IGNORECASE | re.MULTILINE)
                     if found:
                         cloud["subagents"] = int(found.group(1))
+                    if plan.get("bisect"):
+                        bisect = bisect_result(report, plan["bisect"][1])
+                        if bisect:
+                            cloud["bisect"] = bisect
                     cloud_update_meta(meta, meta_path, cloud)
                     print("lane: cloud report saved to {}".format(report_path))
                     if opts.verify:
@@ -3108,7 +3189,27 @@ def codex_log_quota(log_text, final_path):
     return False
 
 
+def keep_cloud_sent(path, meta):
+    """Carry cloud.sent entries that `lane cloud-send` wrote to meta.json into meta before it is rewritten.
+
+    Why: a follow-up can be sent while the run's own lane process is still polling, and that process rewrites
+    meta.json from the copy it holds, which would drop the record of the follow-up."""
+    cloud = meta.get("cloud") if isinstance(meta, dict) else None
+    if not isinstance(cloud, dict):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            on_disk = json.load(stream).get("cloud", {}).get("sent")
+    except (OSError, ValueError, AttributeError):
+        return
+    if not isinstance(on_disk, list):
+        return
+    held = cloud.get("sent") if isinstance(cloud.get("sent"), list) else []
+    cloud["sent"] = held + [entry for entry in on_disk if entry not in held]
+
+
 def write_meta(path, meta):
+    keep_cloud_sent(path, meta)
     temp = path + ".tmp"
     with open(temp, "w", encoding="utf-8") as stream:
         json.dump(meta, stream, indent=2, sort_keys=True)
@@ -4381,6 +4482,9 @@ def build_parser():
     parser.add_argument("--cloud", action="store_true", help="run a Claude lane in its cloud VM")
     parser.add_argument("--verify", action="store_true",
                         help="with --cloud: run the commands the brief lists and return their output; change nothing")
+    parser.add_argument("--bisect", metavar="GOOD_REF",
+                        help="with --cloud --verify: on a failed command, git bisect it from GOOD_REF to the tested "
+                             "commit and report the first bad commit")
     parser.add_argument("--subagent", action="store_true",
                         help="prepare a Claude lane run for a subagent of the main session")
     parser.add_argument("--role", choices=FABLE_ROLES,
@@ -5189,6 +5293,10 @@ def validate_options(parser, opts, catalog):
         parser.error("--cloud is only available for haiku, sonnet, or opus")
     if opts.verify and (not opts.cloud or opts.lane not in CLAUDE_LANES):
         parser.error("--verify needs --cloud and a Claude lane (haiku, sonnet, or opus)")
+    if opts.bisect is not None and not (opts.cloud and opts.verify):
+        parser.error("--bisect needs --cloud --verify")
+    if opts.bisect is not None and (not opts.bisect.strip() or opts.bisect.startswith("-")):
+        parser.error("--bisect needs a git ref or commit (GOOD_REF)")
     if opts.cloud and (opts.resume is not None or opts.web or opts.mask is True):
         parser.error("--cloud cannot be combined with --resume, --web, or --mask")
     if opts.side is not None:
@@ -5350,6 +5458,8 @@ def run_lane(opts, parser):
                        "grok": "grok", "cline": "cline", "amp": "amp"}[provider]
     executable, executable_origin = resolve_binary(executable_name)
     cloud_plan = cloud_preflight(opts.lane, dir_path) if cloud_mode else None
+    if cloud_plan is not None and opts.bisect is not None:
+        cloud_plan["bisect"] = (cloud_plan["base"], cloud_bisect_good(dir_path, opts.bisect, cloud_plan["base"]))
     # A live main cloud session runs the project's units itself; a separate worker VM needs a stated reason.
     side_reason = main_side_check(opts, cloud_plan) if opts.cloud else None
     if not opts.dry_run and not opts.outdir and cloud_mode:
@@ -5424,6 +5534,9 @@ def run_lane(opts, parser):
             cloud_meta["url"] = None
             if side_reason:
                 cloud_meta["side_reason"] = side_reason
+            if cloud_plan.get("bisect"):
+                # The good commit asked for; cloud.bisect is added only when the report has a BISECT line.
+                cloud_meta["bisect_good"] = cloud_plan["bisect"][1]
         else:
             cloud_meta["task_id"] = None
             cloud_meta["url"] = None
@@ -7069,6 +7182,150 @@ def main_start(parser, opts):
     return 0
 
 
+CLOUD_SEND_USAGE = "lane cloud-send <run-id|last|session_...> (-m TEXT | -f FILE)"
+CLOUD_SEND_TIMEOUT = 120
+CLOUD_SESSION_ID_RE = re.compile(r"(?:session|cse)_[A-Za-z0-9_-]+")
+
+
+def cloud_send_runs():
+    """(meta.json path, meta) of every Claude cloud run that recorded a session id, newest first."""
+    runs_dir = os.path.join(state_dir(), "runs")
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return []
+    runs = []
+    for name in names:
+        meta_path = os.path.join(runs_dir, name, "meta.json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as stream:
+                meta = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        cloud = meta.get("cloud") if isinstance(meta, dict) else None
+        if isinstance(cloud, dict) and cloud.get("kind") == "claude" and cloud.get("session_id"):
+            runs.append((str(meta.get("started_at") or ""), name, meta_path, meta))
+    runs.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [(meta_path, meta) for _, _, meta_path, meta in runs]
+
+
+def cloud_send_target(target):
+    """(session id, meta.json path or None) for a run id, a run folder, `last`, or a session_/cse_ id."""
+    if CLOUD_SESSION_ID_RE.fullmatch(target):
+        # Taken as given; the newest run with that session, if any, records the follow-up.
+        meta_path = next((path for path, meta in cloud_send_runs() if meta["cloud"]["session_id"] == target), None)
+        return target, meta_path
+    if target == "last":
+        runs = cloud_send_runs()
+        if not runs:
+            raise LaneError("lane cloud-send: no Claude cloud run with a session id under {}".format(
+                os.path.join(state_dir(), "runs")), 2)
+        meta_path, meta = runs[0]
+        return meta["cloud"]["session_id"], meta_path
+    run_dir = os.path.abspath(os.path.expanduser(target))
+    if not os.path.isdir(run_dir):
+        run_dir = os.path.join(state_dir(), "runs", target)
+    meta_path = os.path.join(run_dir, "meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+    except (OSError, ValueError):
+        raise LaneError("lane cloud-send: {}: meta.json is missing or invalid".format(target), 2)
+    cloud = meta.get("cloud") if isinstance(meta, dict) else None
+    session_id = cloud.get("session_id") if isinstance(cloud, dict) and cloud.get("kind") == "claude" else None
+    if not session_id or not CLOUD_SESSION_ID_RE.fullmatch(str(session_id)):
+        raise LaneError("lane cloud-send: {} is not a Claude cloud run with a session id".format(target), 2)
+    return session_id, meta_path
+
+
+def cloud_send_record(meta_path, entry):
+    """Append entry to cloud.sent in meta.json (read again here, written through write_meta's temp file)."""
+    try:
+        with open(meta_path, "r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+        cloud = meta.setdefault("cloud", {})
+        sent = cloud.get("sent") if isinstance(cloud.get("sent"), list) else []
+        cloud["sent"] = sent + [entry]
+        write_meta(meta_path, meta)
+    except (OSError, ValueError, AttributeError) as exc:
+        print("warning: could not record the follow-up in {} ({})".format(meta_path, exc), file=sys.stderr)
+
+
+def run_cloud_send(argv):
+    """`lane cloud-send`: queue a follow-up message in a Claude cloud run's session.
+
+    Why: a message from another session (SendMessage) to a cloud session in another permission mode is held for its
+    owner to approve, while `claude -p TEXT --cloud ID` run by the owner's own CLI is the owner's message and is
+    delivered. It only queues the message and prints {ok, session_id, url}; the reply comes back through git or the
+    app, not here."""
+    parser = argparse.ArgumentParser(prog="lane cloud-send", usage=CLOUD_SEND_USAGE,
+                                     description="Send a follow-up message into a Claude cloud run's session.")
+    parser.add_argument("target", metavar="RUN", help="a run id or folder, last (the newest cloud run), or a "
+                                                      "session_.../cse_... id")
+    text_source = parser.add_mutually_exclusive_group(required=True)
+    text_source.add_argument("-m", dest="text", metavar="TEXT", help="the message")
+    text_source.add_argument("-f", dest="file", metavar="FILE", help="read the message from FILE (- for stdin)")
+    opts = parser.parse_args(argv)
+    if opts.file is not None:
+        try:
+            if opts.file == "-":
+                data = sys.stdin.buffer.read()
+            else:
+                with open(os.path.expanduser(opts.file), "rb") as stream:
+                    data = stream.read()
+            text = data.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            parser.error("cannot read FILE as UTF-8: {}".format(exc))
+    else:
+        text = opts.text
+    if not text.strip():
+        parser.error("the message is empty")
+    try:
+        session_id, meta_path = cloud_send_target(opts.target)
+        executable, _ = resolve_binary("claude")
+        command = launch_prefix(executable or "claude") + ["-p", text, "--cloud", session_id,
+                                                           "--output-format", "json"]
+        if IS_WINDOWS and windows_command_line_length(command) > WINDOWS_COMMAND_LINE_LIMIT:
+            raise LaneError("lane cloud-send: the message makes the command line longer than the Windows limit of "
+                            "32,767 characters; shorten it", 2)
+    except LaneError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+    result = None
+    error = None
+    try:
+        # -p needs no terminal; stdin is closed so a prompt for input cannot hang the call.
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=CLOUD_SEND_TIMEOUT, check=False, env=claude_cloud_child_env())
+    except subprocess.TimeoutExpired:
+        error = "claude did not answer in {} s".format(CLOUD_SEND_TIMEOUT)
+    except OSError as exc:
+        error = "cannot start {}: {}".format(command[0], exc)
+    answer = {}
+    if result is not None:
+        objects = [value for value in parse_json_objects(result.stdout.decode("utf-8", "replace")) if "ok" in value]
+        answer = objects[-1] if objects else {}
+        if result.returncode and error is None:
+            error = "claude exited {}".format(result.returncode)
+        elif not objects and error is None:
+            error = "claude printed no JSON result"
+    ok = error is None and answer.get("ok") is True
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if meta_path:
+        cloud_send_record(meta_path, {"at": utc_now(), "bytes": len(text.encode("utf-8")), "ok": ok,
+                                      "first_line": first_line[:80]})
+    print("ok: {}".format("true" if ok else "false"))
+    url = answer.get("url") if isinstance(answer.get("url"), str) else None
+    print("url: {}".format(url or "-"))
+    if not ok:
+        detail = error or "claude answered ok={}".format(json.dumps(answer.get("ok")))
+        if result is not None and result.stderr.strip():
+            tail = result.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+            detail += ": " + " | ".join(line.strip() for line in tail)[:300]
+        print("lane cloud-send: not sent to {} ({})".format(session_id, detail), file=sys.stderr)
+    return 0 if ok else 1
+
+
 def use_utf8_streams():
     # Windows pipes default to the ANSI code page, which cannot encode worker output or paths.
     if IS_WINDOWS:
@@ -7094,6 +7351,8 @@ def main(argv=None):
         return 2
     if argv and argv[0] == "main":
         return run_main(argv[1:])
+    if argv and argv[0] == "cloud-send":
+        return run_cloud_send(argv[1:])
     parser = build_parser()
     opts = parser.parse_args(argv)
     try:

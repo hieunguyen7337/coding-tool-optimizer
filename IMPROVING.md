@@ -412,6 +412,12 @@ ships.
   (2026-11-19.1, found by extracting the published bundle under an empty `HOME`). From 2026-11-19.2 such a file
   travels as LF text and `awk` puts each CR back; `make-bundle.sh` refuses a file with mixed line endings. Test a
   release the way a new user meets it: download it from `releases/latest` and extract it under an empty `HOME`.
+- *New policy text goes in its own `##` section.* Codex copies the sections in `platforms/codex/policy.sections`
+  whole into a 16 KiB file; two paragraphs added inside Routing pushed it to 17.7 KB and failed
+  `test_platform_policy` (2026-11-24.1). A new section is only indexed there.
+- *No pack name in a shipped file.* The lean kit refuses any file that contains a skill-pack folder name, so a file
+  name that began with a pack's folder name failed `test_lane_main` (2026-11-24.1; the review-risk override is now
+  `.review-risk.json`). Name packs in notes by what they do, never by folder.
 - *GNU `sha256sum` escapes a path that holds a backslash.* It prefixes the line with `\`, so extracting a bundle into
   a `USAGE_OPTIMIZER_DIR` written with backslashes fails its hash check. Pass forward slashes; the default `$HOME`
   path is fine.
