@@ -418,6 +418,9 @@ ships.
 - *No pack name in a shipped file.* The lean kit refuses any file that contains a skill-pack folder name, so a file
   name that began with a pack's folder name failed `test_lane_main` (2026-11-24.1; the review-risk override is now
   `.review-risk.json`). Name packs in notes by what they do, never by folder.
+- *Check where a cloud run lands, not what the web picker shows.* An uploaded setup script looked live, but CLI cloud
+  sessions ran on `cloud_default` until `remote.defaultEnvironmentId` was set (2026-11-24.2). After any environment
+  change, run one verify that prints `$CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE` and the setup log's last line.
 - *GNU `sha256sum` escapes a path that holds a backslash.* It prefixes the line with `\`, so extracting a bundle into
   a `USAGE_OPTIMIZER_DIR` written with backslashes fails its hash check. Pass forward slashes; the default `$HOME`
   path is fine.

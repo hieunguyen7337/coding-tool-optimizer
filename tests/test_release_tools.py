@@ -319,7 +319,7 @@ class ReleaseToolsTest(unittest.TestCase):
 
     def test_installer_accepts_source_without_skill_folders(self):
         source = self.base / "source-without-skills"
-        shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", "dist"))
+        shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", "dist", ".lane-*", "__pycache__"))
         shutil.rmtree(source / "private" / "skills")
         if (source / "skills").exists():
             shutil.rmtree(source / "skills")

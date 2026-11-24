@@ -1001,8 +1001,43 @@ def cloud_preflight(lane_name, path):
     existed = any(line.split("\t", 1)[-1] == "refs/heads/" + branch
                   for line in cloud_output(remote_branch).splitlines())
     env_label = codex_cloud_env(remote_url) if lane_name == "codex-cloud" else None
+    environment = None
+    if lane_name in CLAUDE_LANES:
+        environment = cloud_default_environment(os.path.abspath(path))
+        if environment is None:
+            print(CLOUD_ENVIRONMENT_UNSET, file=sys.stderr)
     return {"base": cloud_output(base_result), "branch": branch, "remote_url": remote_url,
-            "remote_existed": existed, "env": env_label}
+            "remote_existed": existed, "env": env_label, "environment": environment}
+
+
+# Seen 2026-11-24: with no default set, `claude --cloud` sessions ran on Anthropic's built-in `cloud_default`
+# environment, so the setup script saved in the account's own environment never ran in them.
+CLOUD_ENVIRONMENT_UNSET = (
+    "warning: no default cloud environment is set (remote.defaultEnvironmentId), so this session runs on Anthropic's "
+    "built-in cloud_default environment and your environment's setup script (the kit's cloud-setup: tools, Android, "
+    "message acceptance) does not run; in Claude Code run /remote-env and choose the environment that carries it")
+
+
+def cloud_default_environment(root):
+    """The environment `claude --cloud` starts on: remote.defaultEnvironmentId from the local settings of root (the
+    directory claude starts in, as the CLI reads project settings from its start directory, not the git top level),
+    then its shared settings, then the user's (CLAUDE_CONFIG_DIR or ~/.claude). Like the CLI, a self-hosted pool id
+    (ccpool_) from a project file is skipped. None when no file sets one."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    sources = ((os.path.join(root, ".claude", "settings.local.json"), True),
+               (os.path.join(root, ".claude", "settings.json"), True),
+               (os.path.join(config, "settings.json"), False))
+    for path, project in sources:
+        try:
+            with open(path, encoding="utf-8") as stream:
+                remote = json.load(stream).get("remote")
+        except (OSError, ValueError, AttributeError):
+            continue
+        value = remote.get("defaultEnvironmentId") if isinstance(remote, dict) else None
+        value = value.strip() if isinstance(value, str) else ""
+        if value and not (project and value.startswith("ccpool_")):
+            return value
+    return None
 
 
 def cloud_bisect_good(path, good_ref, tested):
@@ -5534,6 +5569,8 @@ def run_lane(opts, parser):
             cloud_meta["url"] = None
             if side_reason:
                 cloud_meta["side_reason"] = side_reason
+            # The account environment the session starts on; null means Anthropic's built-in cloud_default.
+            cloud_meta["environment"] = cloud_plan.get("environment")
             if cloud_plan.get("bisect"):
                 # The good commit asked for; cloud.bisect is added only when the report has a BISECT line.
                 cloud_meta["bisect_good"] = cloud_plan["bisect"][1]

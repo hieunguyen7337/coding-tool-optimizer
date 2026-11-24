@@ -132,6 +132,16 @@ Runs on one branch share it: each records its claim under `~/.local/state/lanes/
 created on `origin` is deleted by the last run to finish, and only while it still points at a commit `lane` pushed. A
 failed run's reason is in its `meta.json` (`error`) and at the end of `run.log`.
 
+**Which environment (from 2026-11-24.2).** `claude --cloud` starts the session on the environment named by
+`remote.defaultEnvironmentId` in Claude Code's settings (the project's `.claude/settings.local.json`, then
+`.claude/settings.json`, then the user's `settings.json`; `/remote-env` writes the user's). With none set it starts on
+Anthropic's built-in `cloud_default` environment, which has the usual toolchains but not the setup script saved in
+the account's own environment, so the kit's `cloud-setup` (extra tools, Android, `crossSessionInbound`) never runs
+there (2026-11-24: three VMs had no setup log; the type read `cloud_default`). Ticking an environment in claude.ai's
+picker changes only web sessions, and `--environment` takes only self-hosted `ccpool_` ids. A Claude cloud run
+records the id it found as `cloud.environment` (null for `cloud_default`), and `lane` prints a warning when it is
+unset: run `/remote-env` once and choose the environment that carries the kit's setup script.
+
 **Claude (`lane haiku|sonnet|opus --cloud`).** `lane` adds a git contract to the brief and starts
 `claude --cloud "<brief>" --model <m> --effort <e> --permission-mode auto` through `bin/lane-term`, because
 `claude --cloud` refuses to run without a terminal. Without a mode the cloud session starts in accept-edits; auto is

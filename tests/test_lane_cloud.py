@@ -551,7 +551,8 @@ class LaneCloudTests(unittest.TestCase):
         report_path = os.path.join(self.outdir, "report.md")
         with open(report_path, "r", encoding="utf-8") as stream:
             self.assertEqual(stream.read(), "Fake report line\n# Kept heading\n")
-        warnings = [line for line in result.stderr.splitlines() if line.startswith("warning:")]
+        warnings = [line for line in result.stderr.splitlines()
+                    if line.startswith("warning:") and "remote.defaultEnvironmentId" not in line]
         self.assertEqual(len(warnings), 1, result.stderr)
         self.assertIn("1 commit followed lane: done", warnings[0])
         meta = self.read_json(os.path.join(self.outdir, "meta.json"))
@@ -1258,6 +1259,32 @@ class LaneCloudTests(unittest.TestCase):
         self.assertEqual(result.returncode, 8)
         self.assertIn("clean work tree", result.stderr)
         self.assertEqual(self.remote_refs(), {})
+
+    def test_cloud_warns_without_default_environment(self):
+        config = os.path.join(self.root, "claude-config-empty")
+        os.makedirs(config)
+        result = self.run_lane(extra=["--cloud", "--dry-run"], env={"CLAUDE_CONFIG_DIR": config})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("no default cloud environment is set (remote.defaultEnvironmentId)", result.stderr)
+        self.assertIn("/remote-env", result.stderr)
+
+    def test_cloud_records_default_environment(self):
+        config = os.path.join(self.root, "claude-config")
+        os.makedirs(config)
+        os.makedirs(os.path.join(self.workspace, ".claude"))
+        self.write(os.path.join(config, "settings.json"),
+                   json.dumps({"remote": {"defaultEnvironmentId": "env_01TestDefault"}}))
+        # A pool id in a project file is ignored, as the CLI ignores it; the user's id stands.
+        self.write(os.path.join(self.workspace, ".claude", "settings.local.json"),
+                   json.dumps({"remote": {"defaultEnvironmentId": " ccpool_untrusted"}}))
+        self.git("-C", self.workspace, "add", "-f", ".claude/settings.local.json")
+        self.git("-C", self.workspace, "-c", "user.name=Lane Test", "-c", "user.email=lane-test@localhost",
+                 "commit", "-m", "project settings")
+        result = self.run_lane(extra=["--cloud", "--outdir", self.outdir], env={"CLAUDE_CONFIG_DIR": config})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("no default cloud environment", result.stderr)
+        cloud = self.read_json(os.path.join(self.outdir, "meta.json"))["cloud"]
+        self.assertEqual(cloud["environment"], "env_01TestDefault")
 
     def test_claude_requires_github_without_override(self):
         result = self.run_lane(extra=["--cloud", "--dry-run"], env={"LANES_CLOUD_ANY_REMOTE": ""})
